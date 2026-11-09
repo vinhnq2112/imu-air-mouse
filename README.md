@@ -1,33 +1,40 @@
 # imu-air-mouse
 
-Công cụ **offline** để so sánh các thuật toán điều khiển con trỏ TV bằng gyro/accelerometer (air mouse).
+Thuật toán điều khiển con trỏ TV bằng gyro (air mouse), kèm công cụ **offline** để xem thuật toán xử lý một bản ghi sensor như thế nào.
 
-Ghi log IMU một lần, phát lại qua nhiều thuật toán trên cùng dữ liệu, vẽ vết con trỏ chồng nhau, chỉnh tham số bằng slider và tự tính số đo.
+**Một nguồn thuật toán duy nhất: C++.** Đoạn code chạy trên TV ([`cpp/include/GyroPointerCore.h`](cpp/include/GyroPointerCore.h)) cũng là đoạn code dùng để phát lại log. Python chỉ vẽ kết quả, không chứa thuật toán, nên những gì thấy trên biểu đồ đúng là những gì xảy ra trên TV.
 
 ![Ví dụ trên dữ liệu mẫu](overview.png)
 
-## So sánh
+## Cấu trúc
 
-Đầu vào đều là angular velocity, con trỏ dịch `Δ = K · ω · Δt`.
+```
+log sensor (CSV, vòng/giây)
+        │
+        ▼
+cpp/build/gyro_replay      chạy log qua GyroPointerCore (giống hệt trên TV: 1 lần mỗi frame, 60 fps)
+        │                  → CSV output: delta, vị trí con trỏ, trạng thái khóa / precision mode, gain...
+        ▼
+imu_viz.py                 vẽ vết con trỏ, trạng thái, tốc độ góc + ngưỡng, tính số đo
+```
 
-| | Thô (chỉ nhân K) | Có thuật toán |
-|---|---|---|
-| **6-axis** (ω gyro) | `6-axis · thô` | trừ bias, bù roll bằng accel, EMA, dead zone, gain theo tốc độ |
-| **Fusion** (ω từ quaternion Mahony) | `Fusion · thô` | trừ bias, EMA, dead zone, gain theo tốc độ |
+| Thư mục / file | Vai trò |
+|---|---|
+| `cpp/include/GyroPointerCore.h` | Thuật toán, không phụ thuộc engine |
+| `cpp/include/GyroPointer.h` | Lớp bọc cho engine trên TV (`getInputstate`, `steady_clock`) |
+| `cpp/tools/gyro_replay.cpp` | Phát lại log sensor qua thuật toán |
+| `imu_viz.py` | Chỉ visualize output |
 
-Ẩn mặc định, bật bằng checkbox:
-- `6-axis · 1€`: dùng One Euro filter.
-- `Quaternion chip`: dùng khi CSV có các cột `qw, qx, qy, qz`.
+## Cài đặt
 
-Các số đo:
-- **Jitter (px):** độ rung khi đứng yên.
-- **Drift (px/s):** tốc độ trôi khi đứng yên.
-- **Độ trễ (ms):** so với gyro chưa lọc.
-- **Lệch đường thẳng (px):** độ lệch khi kẻ thẳng.
+**1. Build phần C++** (cần CMake 3.14+ và compiler C++17, chi tiết ở [`cpp/README.md`](cpp/README.md)):
 
-## Chạy
+```bash
+cmake -S cpp -B cpp/build
+cmake --build cpp/build --config Release
+```
 
-Cần Python 3.9+. Cài các package (`numpy`, `pandas`, `matplotlib`):
+**2. Cài Python 3.9+ và các package:**
 
 ```bash
 python -m venv .venv                 # tuỳ chọn: tạo môi trường riêng
@@ -35,30 +42,54 @@ source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Chạy
+
 ```bash
-python imu_viz.py demo.csv                       # cửa sổ tương tác
-python imu_viz.py my_log.csv                     # log thật, gyro tính bằng vòng/giây
-python imu_viz.py old_log.csv --gyro-unit rad    # log cũ theo rad/s (hoặc deg nếu là °/s)
-python imu_viz.py demo.csv --save report.png     # xuất ảnh, không mở cửa sổ
-python imu_viz.py --make-demo demo.csv           # tạo lại dữ liệu mẫu (mô phỏng)
+python imu_viz.py demo.csv                         # cửa sổ tương tác
+python imu_viz.py my_log.csv --save report.png     # xuất ảnh, không mở cửa sổ
+python imu_viz.py my_log.csv --stability 7         # chọn sẵn thiết lập
+python imu_viz.py my_log.csv --fps 0               # xử lý mọi sample thay vì 60 fps
+python imu_viz.py --make-demo demo.csv             # tạo lại dữ liệu mẫu (mô phỏng)
 ```
 
-## Định dạng CSV
+Trong cửa sổ, kéo **Độ nhạy** / **Độ ổn định** (1–10) thì tool chạy lại thuật toán C++ với thiết lập mới và vẽ lại ngay. Thanh **Khung thời gian** chọn đoạn vết con trỏ hiển thị.
 
-**Chuẩn đơn vị đầu vào của cả repo: vận tốc góc tính bằng vòng/giây (rev/s)**, giống đầu ra của sensor. Tool Python và bản C++ đều nhận đúng đơn vị này, nên một file log dùng được cho cả hai. Bên trong, thuật toán tự đổi sang rad/s.
+Có thể chạy `gyro_replay` riêng rồi đưa file output cho tool:
+
+```bash
+cpp/build/gyro_replay my_log.csv out.csv --stability 7
+python imu_viz.py out.csv
+```
+
+### Đọc biểu đồ
+
+- **Màn hình ảo:** vết con trỏ, chấm cam là chỗ con trỏ bị khóa (tay dừng).
+- **Vị trí con trỏ:** X, Y theo thời gian.
+- **Tốc độ góc:** |ω| chưa lọc (xám) và sau lọc (xanh), ngưỡng khóa / mở khóa đang dùng. Nền cam = đang khóa, nền xanh lá = precision mode.
+
+### Số đo
+
+| Số đo | Ý nghĩa | Cần nhãn |
+|---|---|---|
+| **Jitter (px)** | độ rung của con trỏ khi tay giữ yên | `still` |
+| **Drift (px/s)** | tốc độ con trỏ trôi khi tay giữ yên | `still` |
+| **Trôi sau dừng (px)** | quãng đường con trỏ còn đi trong 1 s sau khi dừng tay (trôi tiếp, quay ngược) | `still` |
+| **Độ trễ (ms)** | con trỏ chậm hơn chuyển động tay bao lâu | |
+| **Lệch đường thẳng (px)** | độ lệch khi kẻ thẳng | `line` |
+| **Khóa khi đứng yên (%)** | tỉ lệ thời gian con trỏ bị khóa khi tay giữ yên (càng cao càng tốt) | `still` |
+
+## Định dạng log sensor
+
+**Chuẩn đơn vị của cả repo: vận tốc góc tính bằng vòng/giây (rev/s)**, giống đầu ra của sensor. Ghi log thẳng từ `getInputstate()` là dùng được.
 
 | Cột | Ý nghĩa |
 |---|---|
 | `t` | thời gian (s; thêm `--time-unit ms` nếu là ms) |
-| `gx, gy, gz` | vận tốc góc, **vòng/giây** (1.0 = 360°/s). Log cũ theo rad/s hoặc °/s thì thêm `--gyro-unit rad` / `deg` |
-| `ax, ay, az` | gia tốc (đơn vị bất kỳ) |
-| `qw, qx, qy, qz` | *(tuỳ chọn)* quaternion của chip |
-| `phase` | *(tuỳ chọn)* `still` / `line` / `flick` / `circle` — cần `still` để tính jitter/drift, `line` để tính độ lệch |
+| `gx, gy, gz` | vận tốc góc, **vòng/giây** (1.0 = 360°/s) |
+| `phase` | *(tuỳ chọn)* `still` / `line` / `flick` / `circle`, dùng để tính số đo |
 
-Quy ước trục: **X = mũi remote, Y = trái, Z = lên**. Nếu cảm biến gắn khác, dùng `--remap "x=y,y=-x,z=z"`.
+Các cột khác (`ax, ay, az`, ...) được bỏ qua.
 
-`demo.csv` là dữ liệu **mô phỏng**, chỉ để thử tool.
+Quy ước trục giống trên TV: **`gz` (yaw) → con trỏ ngang, `gx` (pitch) → con trỏ dọc**. Nếu log khác, dùng `--yaw-axis` / `--pitch-axis`, ví dụ `--yaw-axis -y`.
 
-## Bản C++
-
-Thuật toán đã chốt (stillness lock + precision mode, low-pass filter, gain curve sigmoid, 2 thiết lập Độ nhạy / Độ ổn định) có bản C++ header-only trong [`cpp/`](cpp/), kèm ví dụ và hướng dẫn build.
+`demo.csv` là dữ liệu **mô phỏng** (rung tay, vẩy nhanh, vẽ tròn khi cầm nghiêng 30°), chỉ để thử tool. Muốn đánh giá thật, hãy ghi log từ remote.

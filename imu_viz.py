@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-imu_viz.py — Công cụ OFFLINE so sánh thuật toán air-mouse (IMU -> con trỏ TV).
+imu_viz.py — Công cụ OFFLINE để xem thuật toán con trỏ air-mouse hoạt động thế nào.
 
-Chạy cùng một bản ghi dữ liệu qua nhiều thuật toán, vẽ vết con trỏ chồng nhau,
-cho phép kéo slider chỉnh tham số và tự tính các số đo (jitter, drift, độ trễ...).
+Python KHÔNG chứa thuật toán. Toàn bộ xử lý nằm ở C++ (cpp/include/GyroPointerCore.h),
+đúng đoạn code chạy trên TV. Tool này chỉ:
+    1. gọi cpp/build/gyro_replay để chạy log sensor qua thuật toán C++,
+    2. vẽ kết quả: vết con trỏ, trạng thái khóa / precision mode, tốc độ góc và ngưỡng,
+    3. tính số đo (jitter, drift, độ trễ, lệch đường thẳng, trôi sau khi dừng).
 
-Cách chạy:
-    python imu_viz.py --make-demo demo.csv      # tạo dữ liệu mẫu để thử
-    python imu_viz.py demo.csv                  # mở cửa sổ tương tác
-    python imu_viz.py my_log.csv --save report.png                   # xuất ảnh
+Cách chạy (build C++ trước, xem cpp/README.md):
+    python imu_viz.py demo.csv                     # cửa sổ tương tác, slider Độ nhạy / Độ ổn định
+    python imu_viz.py my_log.csv --save report.png # xuất ảnh, không mở cửa sổ
+    python imu_viz.py replay_out.csv               # vẽ file output có sẵn của gyro_replay
+    python imu_viz.py --make-demo demo.csv         # tạo lại dữ liệu mẫu (mô phỏng)
 
-Cần: Python 3.9+, numpy, pandas, matplotlib.
+Cần: Python 3.9+, numpy, pandas, matplotlib (pip install -r requirements.txt).
 
-Định dạng CSV (dòng đầu là header):
+Định dạng log sensor (dòng đầu là header):
     t               thời gian (giây; thêm --time-unit ms nếu là mili giây)
-    gx, gy, gz      vận tốc góc (vòng/giây, 1.0 = 360°/s; log cũ theo rad/s hoặc °/s
-                    thì thêm --gyro-unit rad / deg). Bên trong tool đổi sang rad/s.
-    ax, ay, az      gia tốc (đơn vị nào cũng được, chỉ dùng hướng trọng lực)
-    qw, qx, qy, qz  (tuỳ chọn) quaternion do chip fusion xuất ra
+    gx, gy, gz      vận tốc góc, VÒNG/GIÂY (1.0 = 360°/s) — chuẩn đơn vị của cả repo
     phase           (tuỳ chọn) nhãn đoạn test: still / line / flick / circle / ...
-                    -> có nhãn 'still' thì mới tính jitter, drift;
-                       có nhãn 'line' thì mới tính độ lệch đường thẳng.
+                    -> 'still' để tính jitter, drift, trôi sau khi dừng;
+                       'line' để tính độ lệch đường thẳng.
+Các cột khác (ax, ay, az, ...) được bỏ qua.
 
-Quy ước trục thiết bị: X = mũi remote, Y = bên trái, Z = hướng lên (tay phải).
-Nếu cảm biến gắn khác, dùng --remap, ví dụ: --remap "x=y,y=-x,z=z"
-(--remap chỉ áp cho gyro và accel, không áp cho quaternion của chip).
-
-So sánh ma trận 2x2 (đầu vào đều là angular velocity, con trỏ = K * ω * dt):
-                         Thô (chỉ nhân K)          Thuật toán
-    6-axis  (ω gyro)     6-axis · thô              trừ bias + bù roll + EMA + dead zone + gain
-    Fusion  (ω từ        Fusion · thô              trừ bias + EMA + dead zone + gain
-             quaternion Mahony, hướng mũi remote)
-Thêm (ẩn mặc định, bật bằng checkbox):
-    6-axis · 1€          như "6-axis · thuật toán" nhưng dùng One Euro filter
-    Quaternion chip      nếu CSV có qw..qz
+Quy ước trục giống trên TV: gz (yaw) -> con trỏ ngang, gx (pitch) -> con trỏ dọc.
+Đổi bằng --yaw-axis / --pitch-axis, ví dụ: --yaw-axis -y
 """
 
 import argparse
+import io
+import os
+import shutil
+import subprocess
 import sys
 
 import numpy as np
 import pandas as pd
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PHASE_VI = {
     "still": "Đứng yên",
@@ -50,251 +48,69 @@ PHASE_VI = {
     "circle": "Vẽ tròn",
 }
 
+OUTPUT_COLUMNS = {"t", "locked", "precision", "dx", "dy", "x", "y"}
 
 
 # ----------------------------------------------------------------------------
-# Đọc dữ liệu
+# Chạy thuật toán C++
 # ----------------------------------------------------------------------------
-def parse_remap(s):
-    idx = {"x": 0, "y": 1, "z": 2}
-    out = [None, None, None]
-    for part in s.split(","):
-        lhs, rhs = (p.strip().lower() for p in part.split("="))
-        sign = -1.0 if rhs.startswith("-") else 1.0
-        out[idx[lhs]] = (idx[rhs.lstrip("+-")], sign)
-    if None in out:
-        sys.exit("--remap phải gán đủ x, y, z, ví dụ: x=y,y=-x,z=z")
-    return out
+def find_replay(explicit=None):
+    """Tìm file chạy gyro_replay (đã build từ cpp/)."""
+    if explicit:
+        if not os.path.isfile(explicit):
+            sys.exit(f"Không tìm thấy gyro_replay tại: {explicit}")
+        return explicit
+    names = ["gyro_replay", "gyro_replay.exe"]
+    dirs = [os.path.join(REPO_DIR, "cpp", "build", sub) for sub in ("", "Release", "Debug", "RelWithDebInfo")]
+    for d in dirs:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    found = shutil.which("gyro_replay")
+    if found:
+        return found
+    sys.exit(
+        "Chưa có gyro_replay. Build phần C++ trước:\n"
+        "    cmake -S cpp -B cpp/build\n"
+        "    cmake --build cpp/build --config Release\n"
+        "hoặc chỉ định đường dẫn bằng --replay PATH"
+    )
 
 
-def apply_remap(v, m):
-    return np.stack([m[i][1] * v[:, m[i][0]] for i in range(3)], axis=1)
+def run_replay(exe, log_path, args, sensitivity, stability):
+    """Chạy log qua thuật toán C++, trả về DataFrame output (một dòng mỗi frame)."""
+    cmd = [exe, log_path, "-",
+           "--sensitivity", str(int(sensitivity)), "--stability", str(int(stability)),
+           "--fps", str(args.fps), "--time-unit", args.time_unit,
+           "--yaw-axis", args.yaw_axis, "--pitch-axis", args.pitch_axis,
+           "--screen", f"{args.screen[0]}x{args.screen[1]}"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"gyro_replay lỗi:\n{proc.stderr.strip()}")
+    return pd.read_csv(io.StringIO(proc.stdout), keep_default_na=False)
 
 
-def load_csv(path, time_unit="s", gyro_unit="rev", remap=None):
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower() for c in df.columns]
-    need = ["t", "gx", "gy", "gz", "ax", "ay", "az"]
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        sys.exit(f"CSV thiếu cột: {missing}. Cần ít nhất: {need}")
-
-    t = df["t"].to_numpy(float)
-    if time_unit == "ms":
-        t = t / 1000.0
-    t = t - t[0]
-    dt = np.diff(t, prepend=np.nan)
-    dt[0] = np.median(dt[1:])
-    dt = np.clip(dt, 1e-4, 0.1)  # chặn sample lỗi / mất gói
-
-    # Chuẩn đầu vào: vòng/giây (rev/s). Thuật toán bên trong tính theo rad/s.
-    g = df[["gx", "gy", "gz"]].to_numpy(float)
-    if gyro_unit == "rev":
-        g = g * (2.0 * np.pi)
-    elif gyro_unit == "deg":
-        g = np.radians(g)
-    a = df[["ax", "ay", "az"]].to_numpy(float)
-    if remap:
-        m = parse_remap(remap)
-        g, a = apply_remap(g, m), apply_remap(a, m)
-
-    q = None
-    if all(c in df.columns for c in ["qw", "qx", "qy", "qz"]):
-        q = df[["qw", "qx", "qy", "qz"]].to_numpy(float)
-        q /= np.linalg.norm(q, axis=1, keepdims=True)
-
+def load_output(df):
+    """Chuẩn hóa DataFrame output của gyro_replay thành dict numpy."""
     phase = df["phase"].astype(str).str.strip().to_numpy() if "phase" in df else None
-    return dict(t=t, dt=dt, g=g, a=a, q=q, phase=phase, name=str(path))
+    if phase is not None and not np.any(phase != ""):
+        phase = None
+    col = lambda name: df[name].to_numpy(float)
+    return dict(
+        t=col("t"), phase=phase,
+        yaw_raw=col("yaw_raw"), pitch_raw=col("pitch_raw"),
+        yaw_filt=col("yaw_filt"), pitch_filt=col("pitch_filt"),
+        gain=col("gain"), locked=col("locked") > 0.5, precision=col("precision") > 0.5,
+        enter_thr=col("enter_thr"), exit_thr=col("exit_thr"),
+        dx=col("dx"), dy=col("dy"), x=col("x"), y=col("y"),
+    )
 
 
 # ----------------------------------------------------------------------------
-# Bộ lọc
+# Số đo (chỉ phân tích output, không xử lý tín hiệu)
 # ----------------------------------------------------------------------------
-def _alpha(d, fc):
-    tau = 1.0 / (2.0 * np.pi * fc)
-    return d / (tau + d)
-
-
-def lowpass(x, dt, fc):
-    """Lọc thông thấp bậc 1 (EMA) có tính theo dt thực."""
-    y = np.empty_like(x)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = y[i - 1] + _alpha(dt[i], fc) * (x[i] - y[i - 1])
-    return y
-
-
-def one_euro(x, dt, mincutoff, beta, dcutoff=1.0):
-    """One Euro filter: tay di chậm -> lọc mạnh (bớt rung), di nhanh -> lọc nhẹ (bớt trễ)."""
-    y = np.empty_like(x)
-    y[0] = x[0]
-    dx_hat = np.zeros_like(x[0])
-    for i in range(1, len(x)):
-        d = dt[i]
-        dx = (x[i] - y[i - 1]) / d
-        dx_hat = dx_hat + _alpha(d, dcutoff) * (dx - dx_hat)
-        fc = mincutoff + beta * np.abs(dx_hat)
-        y[i] = y[i - 1] + _alpha(d, fc) * (x[i] - y[i - 1])
-    return y
-
-
-# ----------------------------------------------------------------------------
-# Sensor fusion (Mahony, 6 trục)
-# ----------------------------------------------------------------------------
-def mahony(g, a, dt, kp=1.0, ki=0.02):
-    a0 = a[0] / np.linalg.norm(a[0])
-    roll = np.arctan2(a0[1], a0[2])
-    pitch = np.arctan2(-a0[0], np.hypot(a0[1], a0[2]))
-    cr, sr, cp, sp = np.cos(roll / 2), np.sin(roll / 2), np.cos(pitch / 2), np.sin(pitch / 2)
-    w, x, y, z = cr * cp, sr * cp, cr * sp, -sr * sp
-    ix = iy = iz = 0.0
-    out = np.empty((len(g), 4))
-    for i in range(len(g)):
-        ax_, ay_, az_ = a[i]
-        n = (ax_ * ax_ + ay_ * ay_ + az_ * az_) ** 0.5
-        gx, gy, gz = g[i]
-        if n > 1e-9:
-            ax_, ay_, az_ = ax_ / n, ay_ / n, az_ / n
-            # hướng trọng lực dự đoán trong hệ thiết bị
-            vx = 2 * (x * z - w * y)
-            vy = 2 * (w * x + y * z)
-            vz = w * w - x * x - y * y + z * z
-            ex, ey, ez = ay_ * vz - az_ * vy, az_ * vx - ax_ * vz, ax_ * vy - ay_ * vx
-            d = dt[i]
-            ix += ki * ex * d
-            iy += ki * ey * d
-            iz += ki * ez * d
-            gx += kp * ex + ix
-            gy += kp * ey + iy
-            gz += kp * ez + iz
-        h = 0.5 * dt[i]
-        w, x, y, z = (
-            w + h * (-x * gx - y * gy - z * gz),
-            x + h * (w * gx + y * gz - z * gy),
-            y + h * (w * gy - x * gz + z * gx),
-            z + h * (w * gz + x * gy - y * gx),
-        )
-        n = (w * w + x * x + y * y + z * z) ** 0.5
-        w, x, y, z = w / n, x / n, y / n, z / n
-        out[i] = (w, x, y, z)
-    return out
-
-
-def pointing_rates(q, dt):
-    """Từ quaternion -> tốc độ (yaw, pitch) của vector mũi remote, rad/s.
-    Quy ước pitch dương = chúc mũi xuống (giống ω_y)."""
-    w, x, y, z = q.T
-    fx = 1 - 2 * (y * y + z * z)
-    fy = 2 * (x * y + w * z)
-    fz = 2 * (x * z - w * y)
-    yaw = np.arctan2(fy, fx)
-    pitch = np.arcsin(np.clip(fz, -1, 1))
-    dyaw = np.diff(yaw, prepend=yaw[0])
-    dyaw = (dyaw + np.pi) % (2 * np.pi) - np.pi  # xử lý nhảy ±180°
-    dp = np.diff(pitch, prepend=pitch[0])
-    return np.stack([dyaw / dt, -dp / dt], axis=1)
-
-
-# ----------------------------------------------------------------------------
-# Các bước dùng chung
-# ----------------------------------------------------------------------------
-def level_rates(data, bias, roll_fc=2.0):
-    """Trừ bias + bù roll -> (ω_yaw, ω_pitch) trong hệ 'remote thẳng đứng'."""
-    g = data["g"] - bias
-    a_lp = lowpass(data["a"], data["dt"], roll_fc)
-    phi = np.arctan2(a_lp[:, 1], a_lp[:, 2])
-    c, s = np.cos(phi), np.sin(phi)
-    yaw = g[:, 1] * s + g[:, 2] * c
-    pitch = g[:, 1] * c - g[:, 2] * s
-    return np.stack([yaw, pitch], axis=1)
-
-
-def shape(rate, P):
-    """Dead zone + gain theo tốc độ -> vận tốc con trỏ (px/s), trục màn hình."""
-    sp = np.hypot(rate[:, 0], rate[:, 1])
-    sp2 = np.maximum(sp - P["dz"], 0.0)
-    scale = sp2 / np.maximum(sp, 1e-12)
-    k = P["K"] * (1.0 + P["accel"] * sp2)
-    v = rate * (scale * k)[:, None]
-    return np.stack([-v[:, 0], v[:, 1]], axis=1)  # yaw trái(+) -> x giảm
-
-
-def integrate(v, dt, W, H):
-    pos = np.empty_like(v)
-    cx, cy = W / 2.0, H / 2.0
-    for i in range(len(v)):
-        cx = min(max(cx + v[i, 0] * dt[i], 0.0), W - 1.0)
-        cy = min(max(cy + v[i, 1] * dt[i], 0.0), H - 1.0)
-        pos[i] = (cx, cy)
-    return pos
-
-
-# ----------------------------------------------------------------------------
-# Thuật toán
-# ----------------------------------------------------------------------------
-def build_pipelines(data, W, H, calib_s, kp, ki):
-    dt = data["dt"]
-    calib = data["t"] < calib_s
-    bias = data["g"][calib].mean(axis=0) if calib.sum() > 5 else np.zeros(3)
-    ref = level_rates(data, bias)  # tham chiếu: đã trừ bias, bù roll, chưa lọc
-    # Fusion thô: Mahony chạy trên gyro thô; Fusion thuật toán: trừ bias trước khi fusion
-    fusion_raw = pointing_rates(mahony(data["g"], data["a"], dt, kp, ki), dt)
-    fusion_rates = pointing_rates(mahony(data["g"] - bias, data["a"], dt, kp, ki), dt)
-    chip_rates = pointing_rates(data["q"], dt) if data["q"] is not None else None
-
-    def linear(r, P):  # chỉ nhân K, không dead zone / gain / lọc
-        return np.stack([-P["K"] * r[:, 0], P["K"] * r[:, 1]], axis=1)
-
-    # --- Nguồn 6-axis: ω thô từ gyro ---
-    def p6_raw(P):
-        r = data["g"][:, [2, 1]]
-        return r, linear(r, P)
-
-    def p6_algo(P):  # bias + bù roll + EMA + dead zone + gain theo tốc độ
-        r = lowpass(ref, dt, P["fc"])
-        return r, shape(r, P)
-
-    # --- Nguồn Sensor Fusion: ω lấy từ quaternion (hướng mũi remote) ---
-    def pf_raw(P):
-        return fusion_raw, linear(fusion_raw, P)
-
-    def pf_algo(P):  # trừ bias + EMA + dead zone + gain (roll đã do fusion xử lý)
-        r = lowpass(fusion_rates, dt, P["fc"])
-        return r, shape(r, P)
-
-    def p6_euro(P):
-        r = one_euro(ref, dt, P["mincut"], P["beta"])
-        return r, shape(r, P)
-
-    # (tên, hàm, màu, hiện mặc định)
-    pipes = [
-        ("6-axis · thô", p6_raw, "#E69F00", True),
-        ("6-axis · thuật toán", p6_algo, "#D55E00", True),
-        ("Fusion · thô", pf_raw, "#56B4E9", True),
-        ("Fusion · thuật toán", pf_algo, "#0072B2", True),
-        ("6-axis · 1€ (thêm)", p6_euro, "#009E73", False),
-    ]
-    if chip_rates is not None:
-        def p_chip(P):
-            r = lowpass(chip_rates, dt, P["fc"])
-            return r, shape(r, P)
-        pipes.append(("Quaternion chip (thêm)", p_chip, "#CC79A7", False))
-
-    def run_all(P):
-        out = []
-        for name, fn, color, on in pipes:
-            rate, v = fn(P)
-            out.append(dict(name=name, color=color, on=on,
-                            rate=rate, v=v, pos=integrate(v, dt, W, H)))
-        return out
-
-    return run_all, ref, bias
-
-
-# ----------------------------------------------------------------------------
-# Số đo
-# ----------------------------------------------------------------------------
-def segments(mask, min_len=20):
+def segments(mask, min_len=10):
     segs, start = [], None
     for i, m in enumerate(np.append(mask, False)):
         if m and start is None:
@@ -306,88 +122,114 @@ def segments(mask, min_len=20):
     return segs
 
 
-def compute_metrics(res, data, ref):
-    t, phase = data["t"], data["phase"]
+def compute_metrics(r):
+    t, phase = r["t"], r["phase"]
+    pos = np.stack([r["x"], r["y"]], axis=1)
     still = phase == "still" if phase is not None else np.zeros(len(t), bool)
     line = phase == "line" if phase is not None else np.zeros(len(t), bool)
-    moving = ~still
-    med_dt = np.median(data["dt"])
-    rows = []
-    for r in res:
-        pos = r["pos"]
-        # Jitter & drift trong các đoạn đứng yên
-        jit, drift = [], []
-        for s, e in segments(still):
-            tt = t[s:e] - t[s:e].mean()
-            sl = []
-            resid2 = np.zeros(e - s)
-            for k in range(2):
-                p = np.polyfit(tt, pos[s:e, k], 1)
-                sl.append(p[0])
-                resid2 += (pos[s:e, k] - np.polyval(p, tt)) ** 2
-            jit.append(resid2)
-            drift.append(np.hypot(*sl))
-        jitter = np.sqrt(np.concatenate(jit).mean()) if jit else np.nan
-        drift = float(np.mean(drift)) if drift else np.nan
+    dt = np.median(np.diff(t))
 
-        # Độ trễ: cross-correlation giữa ω tham chiếu và vận tốc con trỏ
-        refx, vx = -ref[:, 0], r["v"][:, 0]
-        if moving.sum() > 50:
-            refx, vx = refx * moving, vx * moving
-            best, lag = -np.inf, 0
-            for L in range(0, int(0.3 / med_dt)):
-                a_, b_ = refx[: len(refx) - L], vx[L:]
-                den = np.linalg.norm(a_) * np.linalg.norm(b_)
-                c = (a_ @ b_) / den if den > 0 else 0
-                if c > best:
-                    best, lag = c, L
-            latency = lag * med_dt * 1000
-        else:
-            latency = np.nan
+    # Jitter (độ rung quanh xu hướng) & drift (tốc độ trôi) trong các đoạn đứng yên
+    jit, drift = [], []
+    for s, e in segments(still):
+        tt = t[s:e] - t[s:e].mean()
+        slopes, resid2 = [], np.zeros(e - s)
+        for k in range(2):
+            p = np.polyfit(tt, pos[s:e, k], 1)
+            slopes.append(p[0])
+            resid2 += (pos[s:e, k] - np.polyval(p, tt)) ** 2
+        jit.append(resid2)
+        drift.append(np.hypot(*slopes))
+    jitter = float(np.sqrt(np.concatenate(jit).mean())) if jit else np.nan
+    drift = float(np.mean(drift)) if drift else np.nan
 
-        # Độ lệch khỏi đường thẳng khi kẻ thẳng
-        dev = []
-        for s, e in segments(line):
-            p = pos[s:e] - pos[s:e].mean(axis=0)
-            _, _, vt = np.linalg.svd(p, full_matrices=False)
-            dev.append(p @ vt[1])
-        straight = np.sqrt(np.mean(np.concatenate(dev) ** 2)) if dev else np.nan
+    # Trôi sau khi dừng: quãng đường con trỏ còn đi trong 1 s đầu của đoạn đứng yên
+    # ngay sau một đoạn di chuyển (gồm cả trôi tiếp và quay ngược).
+    settle = []
+    for s, e in segments(still):
+        if s == 0:
+            continue
+        end = min(e, s + int(round(1.0 / dt)))
+        settle.append(np.abs(np.diff(pos[s:end], axis=0)).sum(axis=1).sum())
+    settle = float(np.mean(settle)) if settle else np.nan
 
-        rows.append(dict(name=r["name"], jitter=jitter, drift=drift,
-                         latency=latency, straight=straight))
-    return rows
+    # Độ trễ: lệch thời gian giữa ω chưa lọc và vận tốc con trỏ (cross-correlation)
+    moving = ~still if phase is not None else np.ones(len(t), bool)
+    ref, vx = -r["yaw_raw"] * moving, r["dx"] * moving
+    latency = np.nan
+    if moving.sum() > 30 and np.any(vx):
+        best, lag = -np.inf, 0
+        for L in range(0, int(0.3 / dt)):
+            a_, b_ = ref[: len(ref) - L], vx[L:]
+            den = np.linalg.norm(a_) * np.linalg.norm(b_)
+            c = (a_ @ b_) / den if den > 0 else 0
+            if c > best:
+                best, lag = c, L
+        latency = lag * dt * 1000
+
+    # Độ lệch khỏi đường thẳng khi kẻ thẳng
+    dev = []
+    for s, e in segments(line):
+        p = pos[s:e] - pos[s:e].mean(axis=0)
+        _, _, vt = np.linalg.svd(p, full_matrices=False)
+        dev.append(p @ vt[1])
+    straight = float(np.sqrt(np.mean(np.concatenate(dev) ** 2))) if dev else np.nan
+
+    locked_still = float(r["locked"][still].mean() * 100) if still.any() else np.nan
+
+    return dict(jitter=jitter, drift=drift, settle=settle, latency=latency,
+                straight=straight, locked_still=locked_still)
 
 
-def fmt(v, unit=""):
-    return "–" if np.isnan(v) else f"{v:.1f}{unit}"
+def fmt(v, digits=1):
+    return "–" if v is None or np.isnan(v) else f"{v:.{digits}f}"
+
+
+METRIC_COLUMNS = [
+    ("jitter", "Jitter (px)"),
+    ("drift", "Drift (px/s)"),
+    ("settle", "Trôi sau dừng (px)"),
+    ("latency", "Độ trễ (ms)"),
+    ("straight", "Lệch đường thẳng (px)"),
+    ("locked_still", "Khóa khi đứng yên (%)"),
+]
 
 
 # ----------------------------------------------------------------------------
 # Giao diện
 # ----------------------------------------------------------------------------
-def run_ui(data, args):
+def run_ui(source, args):
+    """source: ('log', path, exe) để chạy C++ theo slider, hoặc ('output', DataFrame, name)."""
     import matplotlib
     if args.save:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import CheckButtons, RangeSlider, Slider
+    from matplotlib.widgets import RangeSlider, Slider
 
     W, H = args.screen
-    run_all, ref, bias = build_pipelines(data, W, H, args.calib, args.kp, args.ki)
-    t = data["t"]
-    P = dict(K=args.K, dz=args.deadzone, accel=args.accel, fc=args.fc,
-             mincut=args.mincut, beta=args.beta)
+    interactive_settings = source[0] == "log"
+    settings = dict(sensitivity=args.sensitivity, stability=args.stability)
+
+    def compute():
+        if interactive_settings:
+            return load_output(run_replay(source[2], source[1], args,
+                                          settings["sensitivity"], settings["stability"]))
+        return load_output(source[1])
+
+    r = compute()
+    t = r["t"]
+    name = os.path.basename(source[1] if interactive_settings else source[2])
 
     plt.rcParams.update({"font.size": 9, "axes.spines.top": False, "axes.spines.right": False})
-    fig = plt.figure(figsize=(16, 9))
-    fig.canvas.manager.set_window_title("IMU air-mouse — so sánh thuật toán") if not args.save else None
-    fig.suptitle(f"So sánh thuật toán con trỏ — {data['name']}   "
-                 f"(bias gyro ước lượng: {np.degrees(bias).round(2)} °/s)", fontsize=11)
+    fig = plt.figure(figsize=(16, 9.4))
+    if not args.save:
+        fig.canvas.manager.set_window_title("IMU air-mouse — thuật toán C++")
+    title = fig.suptitle("", fontsize=11)
 
-    ax_scr = fig.add_axes([0.04, 0.33, 0.48, 0.58])
-    ax_x = fig.add_axes([0.58, 0.66, 0.40, 0.25])
-    ax_w = fig.add_axes([0.58, 0.33, 0.40, 0.27], sharex=ax_x)
-    ax_tbl = fig.add_axes([0.58, 0.02, 0.40, 0.22])
+    ax_scr = fig.add_axes([0.04, 0.34, 0.48, 0.56])
+    ax_pos = fig.add_axes([0.58, 0.67, 0.40, 0.23])
+    ax_w = fig.add_axes([0.58, 0.36, 0.40, 0.26], sharex=ax_pos)
+    ax_tbl = fig.add_axes([0.04, 0.02, 0.94, 0.13])
     ax_tbl.axis("off")
 
     # Màn hình ảo
@@ -398,130 +240,153 @@ def run_ui(data, args):
     ax_scr.set_title(f"Màn hình ảo {W}×{H} — vết con trỏ (chấm = vị trí cuối khung thời gian)")
     ax_scr.set_xticks([0, W // 2, W])
     ax_scr.set_yticks([0, H // 2, H])
+    trail, = ax_scr.plot([], [], color="#0072B2", lw=1.2)
+    dot, = ax_scr.plot([], [], "o", color="#0072B2", ms=7, mec="white")
+    stops, = ax_scr.plot([], [], "o", color="#D55E00", ms=3.5, alpha=0.8, label="điểm dừng (khóa)")
+    ax_scr.legend(loc="lower right", fontsize=8, frameon=False)
 
-    # Tô nền các đoạn test
-    if data["phase"] is not None:
-        ph = data["phase"]
+    # Nhãn các đoạn test
+    if r["phase"] is not None:
+        ph = r["phase"]
         change = np.flatnonzero(np.r_[True, ph[1:] != ph[:-1], True])
         for j, (s, e) in enumerate(zip(change[:-1], change[1:])):
-            for ax in (ax_x, ax_w):
-                ax.axvspan(t[s], t[e - 1], color="#000", alpha=0.04 if j % 2 else 0.0, lw=0)
-            ax_x.text((t[s] + t[e - 1]) / 2, 1.02, PHASE_VI.get(ph[s], ph[s]),
-                      transform=ax_x.get_xaxis_transform(), ha="center", va="bottom", fontsize=8)
+            ax_pos.text((t[s] + t[e - 1]) / 2, 1.02, PHASE_VI.get(ph[s], ph[s]),
+                        transform=ax_pos.get_xaxis_transform(), ha="center", va="bottom", fontsize=8)
 
-    ax_x.set_ylabel("Vị trí X con trỏ (px)")
-    ax_w.set_ylabel("Tốc độ yaw đã xử lý (°/s)")
+    ax_pos.set_ylabel("Vị trí con trỏ (px)")
+    ax_pos.set_ylim(-20, max(W, H) + 20)
+    l_x, = ax_pos.plot(t, r["x"], color="#0072B2", lw=1.1, label="X")
+    l_y, = ax_pos.plot(t, r["y"], color="#009E73", lw=1.1, label="Y")
+    ax_pos.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
+
+    ax_w.set_ylabel("Tốc độ góc (°/s)")
     ax_w.set_xlabel("Thời gian (s)")
+    ax_w.set_yscale("symlog", linthresh=1.0)
+    ax_w.set_ylim(0, None)
 
-    res = run_all(P)
-    lines = []
-    for r in res:
-        tr, = ax_scr.plot([], [], color=r["color"], lw=1.2, alpha=0.85)
-        dot, = ax_scr.plot([], [], "o", color=r["color"], ms=7, mec="white")
-        lx, = ax_x.plot(t, r["pos"][:, 0], color=r["color"], lw=1.1, label=r["name"])
-        lw_, = ax_w.plot(t, np.degrees(r["rate"][:, 0]), color=r["color"], lw=0.9)
-        lines.append(dict(trail=tr, dot=dot, x=lx, w=lw_))
-    ax_x.legend(loc="upper left", fontsize=8, ncol=2, frameon=False)
-    ax_x.set_ylim(-20, W + 20)
-    win_x = ax_x.axvspan(t[0], t[-1], color="#0072B2", alpha=0.08, lw=0)
-    win_w = ax_w.axvspan(t[0], t[-1], color="#0072B2", alpha=0.08, lw=0)
+    dyn = {}  # các artist vẽ lại khi đổi thiết lập
+
+    def draw_dynamic():
+        for a in dyn.pop("artists", []):
+            a.remove()
+        arts = []
+        raw = np.degrees(np.hypot(r["yaw_raw"], r["pitch_raw"]))
+        filt = np.degrees(np.hypot(r["yaw_filt"], r["pitch_filt"]))
+        arts += ax_w.plot(t, raw, color="#999", lw=0.8, label="|ω| chưa lọc")
+        arts += ax_w.plot(t, filt, color="#0072B2", lw=1.0, label="|ω| sau lọc (0 khi khóa)")
+        arts += ax_w.step(t, np.degrees(r["enter_thr"]), where="post", color="#D55E00",
+                          lw=0.9, ls="--", label="ngưỡng khóa")
+        arts += ax_w.step(t, np.degrees(r["exit_thr"]), where="post", color="#CC79A7",
+                          lw=0.9, ls=":", label="ngưỡng mở khóa")
+        for ax in (ax_pos, ax_w):
+            for s, e in segments(r["locked"], min_len=1):
+                arts.append(ax.axvspan(t[s], t[min(e, len(t) - 1)], color="#D55E00", alpha=0.10, lw=0))
+            for s, e in segments(r["precision"] & ~r["locked"], min_len=1):
+                arts.append(ax.axvspan(t[s], t[min(e, len(t) - 1)], color="#009E73", alpha=0.12, lw=0))
+        top = max(np.percentile(raw, 99.8) * 6, 30)  # chừa chỗ cho chú thích
+        ax_w.set_ylim(0, top)
+        handles = [arts[0], arts[1], arts[2], arts[3],
+                   plt.Rectangle((0, 0), 1, 1, color="#D55E00", alpha=0.25),
+                   plt.Rectangle((0, 0), 1, 1, color="#009E73", alpha=0.25)]
+        leg = ax_w.legend(handles, ["|ω| chưa lọc", "|ω| sau lọc", "ngưỡng khóa", "ngưỡng mở khóa",
+                                    "đang khóa", "precision mode"],
+                          loc="upper left", fontsize=7.5, ncol=3, frameon=False)
+        arts.append(leg)
+        dyn["artists"] = arts
+        l_x.set_ydata(r["x"])
+        l_y.set_ydata(r["y"])
+
+        m = compute_metrics(r)
+        dyn["metrics"] = m
+        if "tbl" in dyn:
+            dyn["tbl"].remove()
+        tb = ax_tbl.table(cellText=[[fmt(m[k]) for k, _ in METRIC_COLUMNS]],
+                          colLabels=[lbl for _, lbl in METRIC_COLUMNS],
+                          loc="upper center", cellLoc="center")
+        tb.auto_set_font_size(False)
+        tb.set_fontsize(9)
+        tb.scale(1, 1.5)
+        dyn["tbl"] = tb
+        ax_tbl.set_title("Số đo — càng nhỏ càng tốt (trừ % khóa khi đứng yên). Jitter, drift, trôi sau dừng: "
+                         "đoạn 'still'; độ trễ: so với ω chưa lọc; lệch: đoạn 'line'.",
+                         fontsize=8.5, loc="left")
+        detail = (f"   |   Độ nhạy {settings['sensitivity']} · Độ ổn định {settings['stability']}"
+                  f" · {args.fps:g} fps" if interactive_settings else "   |   output có sẵn của gyro_replay")
+        title.set_text(f"Thuật toán C++ (GyroPointerCore) — {name}{detail}")
 
     # Sliders
     sx, sw, sh = 0.13, 0.32, 0.022
-    def mk(y, label, lo, hi, val, fmt_="%.2f"):
-        return Slider(fig.add_axes([sx, y, sw, sh]), label, lo, hi, valinit=val, valfmt=fmt_)
-    s_K = mk(0.255, "K (px/rad)", 500, 6000, P["K"], "%.0f")
-    s_dz = mk(0.225, "Dead zone (rad/s)", 0.0, 0.15, P["dz"], "%.3f")
-    s_ac = mk(0.195, "Gain theo tốc độ", 0.0, 3.0, P["accel"])
-    s_fc = mk(0.165, "EMA fc (Hz)", 0.5, 30.0, P["fc"], "%.1f")
-    s_mc = mk(0.135, "1€ min fc (Hz)", 0.1, 10.0, P["mincut"], "%.2f")
-    s_bt = mk(0.105, "1€ beta", 0.0, 0.5, P["beta"], "%.3f")
-    s_tw = RangeSlider(fig.add_axes([sx, 0.06, sw, sh]), "Khung thời gian (s)",
+    s_tw = RangeSlider(fig.add_axes([sx, 0.19, sw, sh]), "Khung thời gian (s)",
                        t[0], t[-1], valinit=(t[0], t[-1]), valfmt="%.1f")
-
-    chk = CheckButtons(fig.add_axes([0.47, 0.06, 0.10, 0.22], frameon=False),
-                       [r["name"] for r in res], [r["on"] for r in res])
-    try:
-        for lbl, r in zip(chk.labels, res):
-            lbl.set_color(r["color"])
-            lbl.set_fontsize(8)
-    except Exception:
-        pass
-
-    table_holder = {}
-
-    def draw_table():
-        if "tbl" in table_holder:
-            table_holder["tbl"].remove()
-        rows = compute_metrics(res, data, ref)
-        cell = [[r["name"], fmt(r["jitter"]), fmt(r["drift"]), fmt(r["latency"]), fmt(r["straight"])]
-                for r in rows]
-        tb = ax_tbl.table(cellText=cell, loc="upper center", cellLoc="center",
-                          colLabels=["Thuật toán", "Jitter (px)", "Drift (px/s)",
-                                     "Độ trễ (ms)", "Lệch đường thẳng (px)"])
-        tb.auto_set_font_size(False)
-        tb.set_fontsize(8.5)
-        tb.scale(1, 1.35)
-        for i, r in enumerate(res):
-            tb[i + 1, 0].get_text().set_color(r["color"])
-        table_holder["tbl"] = tb
-        ax_tbl.set_title("Số đo — càng nhỏ càng tốt  (jitter/drift: đoạn đứng yên; "
-                         "độ trễ: so với gyro chưa lọc)", fontsize=8.5, loc="left")
+    sliders = []
+    if interactive_settings:
+        s_sens = Slider(fig.add_axes([sx, 0.25, sw, sh]), "Độ nhạy", 1, 10,
+                        valinit=settings["sensitivity"], valstep=1, valfmt="%d")
+        s_stab = Slider(fig.add_axes([sx, 0.22, sw, sh]), "Độ ổn định", 1, 10,
+                        valinit=settings["stability"], valstep=1, valfmt="%d")
+        sliders = [s_sens, s_stab]
+    win = [ax.axvspan(t[0], t[-1], color="#0072B2", alpha=0.06, lw=0) for ax in (ax_pos, ax_w)]
 
     def redraw_window(*_):
         lo, hi = s_tw.val
-        m = (t >= lo) & (t <= hi)
-        idx = np.flatnonzero(m)
-        for r, L, on in zip(res, lines, chk.get_status()):
-            if len(idx):
-                L["trail"].set_data(r["pos"][idx, 0], r["pos"][idx, 1])
-                L["dot"].set_data([r["pos"][idx[-1], 0]], [r["pos"][idx[-1], 1]])
-            for k in ("trail", "dot", "x", "w"):
-                L[k].set_visible(on)
-        for span in (win_x, win_w):
-            span.set_x(lo) if hasattr(span, "set_x") else None
-            try:
+        idx = np.flatnonzero((t >= lo) & (t <= hi))
+        if len(idx):
+            trail.set_data(r["x"][idx], r["y"][idx])
+            dot.set_data([r["x"][idx[-1]]], [r["y"][idx[-1]]])
+            lk = r["locked"][idx]
+            starts = idx[np.flatnonzero(lk & ~np.r_[False, lk[:-1]])]
+            stops.set_data(r["x"][starts], r["y"][starts])
+        for span in win:
+            # axvspan là Rectangle (matplotlib >= 3.9) hoặc Polygon (bản cũ hơn)
+            if hasattr(span, "set_width"):
+                span.set_x(lo)
                 span.set_width(hi - lo)
-            except AttributeError:
-                span.set_xy([[lo, 0], [lo, 1], [hi, 1], [hi, 0]])
+            else:
+                span.set_xy([[lo, 0], [lo, 1], [hi, 1], [hi, 0], [lo, 0]])
         fig.canvas.draw_idle()
 
-    def recompute(_=None):
-        P.update(K=s_K.val, dz=s_dz.val, accel=s_ac.val, fc=s_fc.val,
-                 mincut=s_mc.val, beta=s_bt.val)
-        res[:] = run_all(P)
-        for r, L in zip(res, lines):
-            L["x"].set_ydata(r["pos"][:, 0])
-            L["w"].set_ydata(np.degrees(r["rate"][:, 0]))
-        draw_table()
+    def on_settings(_=None):
+        settings.update(sensitivity=int(sliders[0].val), stability=int(sliders[1].val))
+        new = compute()
+        r.clear()
+        r.update(new)
+        draw_dynamic()
         redraw_window()
 
-    for s in (s_K, s_dz, s_ac, s_fc, s_mc, s_bt):
-        s.on_changed(recompute)
+    for s in sliders:
+        s.on_changed(on_settings)
     s_tw.on_changed(redraw_window)
-    chk.on_clicked(redraw_window)
 
-    draw_table()
+    draw_dynamic()
     redraw_window()
-    ymax = np.percentile(np.abs(np.degrees(data["g"][:, 2])), 99.5) * 1.15
-    ax_w.set_ylim(-ymax, ymax)
 
     if args.save:
         if args.window:
             s_tw.set_val(tuple(args.window))
         fig.savefig(args.save, dpi=110)
+        m = dyn["metrics"]
         print(f"Đã lưu {args.save}")
-        for r in compute_metrics(res, data, ref):
-            print(f"  {r['name']:<24} jitter={fmt(r['jitter'])}px  drift={fmt(r['drift'])}px/s  "
-                  f"trễ={fmt(r['latency'])}ms  lệch={fmt(r['straight'])}px")
+        print("  " + "  ".join(f"{lbl}={fmt(m[k])}" for k, lbl in METRIC_COLUMNS))
     else:
         plt.show()
 
 
 # ----------------------------------------------------------------------------
-# Dữ liệu mẫu (mô phỏng)
+# Dữ liệu mẫu (mô phỏng, chỉ để thử tool — không phải thuật toán)
 # ----------------------------------------------------------------------------
+def _smooth_noise(rng, n, fc, fs, scale):
+    """Nhiễu ngẫu nhiên đã làm mượt, mô phỏng rung tay không đều."""
+    x = rng.normal(0, scale, n)
+    a = (1 / fs) / (1 / fs + 1 / (2 * np.pi * fc))
+    y = np.empty_like(x)
+    y[0] = x[0]
+    for i in range(1, n):
+        y[i] = y[i - 1] + a * (x[i] - y[i - 1])
+    return y
+
+
 def make_demo(path, seed=1):
+    """Log mô phỏng theo quy ước trục của TV: gz = yaw, gx = pitch, gy = roll; đơn vị vòng/giây."""
     rng = np.random.default_rng(seed)
     fs, G = 100.0, 9.81
     plan = [  # (phase, giây)
@@ -531,85 +396,66 @@ def make_demo(path, seed=1):
     T = sum(d for _, d in plan)
     n = int(T * fs)
     t = np.cumsum(np.r_[0, 1 / fs + rng.normal(0, 0.0008, n - 1)])  # dt dao động như thật
-    yaw = np.zeros(n); pit = np.zeros(n); roll = np.zeros(n); phase = np.empty(n, object)
+    yaw = np.zeros(n); pit = np.zeros(n); phase = np.empty(n, object)
     t0 = 0.0
     for ph, d in plan:
         m = (t >= t0) & (t < t0 + d)
         u = t[m] - t0
         phase[m] = ph
         if ph == "line":
-            yaw[m] = -0.08 * np.sin(np.pi * u / d) ** 0.3          # kéo sang phải đều
+            yaw[m] = -0.08 * np.sin(np.pi * u / d) ** 0.3          # kéo sang phải đều (rad/s)
             pit[m] = 0.01 * np.sin(2 * np.pi * u / d)
         elif ph == "flick":
-            for k, (sy, sp) in enumerate([(1, 0), (-1, 0.6), (0, -0.6)]):
+            for k, (sy, sp) in enumerate([(1, 0), (-1, 0.4), (0, -0.4)]):
                 c = 0.3 + k * 1.2
                 w = (u > c) & (u < c + 0.25)
-                pulse = np.sin(np.pi * (u[w] - c) / 0.25) ** 2 * 1.2
+                pulse = np.sin(np.pi * (u[w] - c) / 0.25) ** 2 * 0.9
                 yaw[np.flatnonzero(m)[w]] = sy * pulse
                 pit[np.flatnonzero(m)[w]] = sp * pulse
         elif ph == "circle":
-            A, Tc = 0.25, 2.0
+            A, Tc = 0.18, 2.0
             yaw[m] = A * np.cos(2 * np.pi * u / Tc)
             pit[m] = A * np.sin(2 * np.pi * u / Tc)
         t0 += d
-    # Cầm nghiêng 30° quanh đoạn vẽ tròn
+    # Cầm nghiêng 30° quanh đoạn vẽ tròn (trục yaw/pitch bị trộn vào nhau)
     tc0 = sum(d for _, d in plan[:5])
     roll = np.radians(30) * np.clip((t - (tc0 - 1.0)) / 0.8, 0, 1) * np.clip((tc0 + 4.8 - t) / 0.8, 0, 1)
-    # Run tay sinh lý ~9 Hz + run ngẫu nhiên
-    trem = 0.012 * np.sin(2 * np.pi * 9.2 * t + rng.uniform(0, 6)) + lowpass_np(rng.normal(0, 0.03, n), 6, fs)
-    trem2 = 0.010 * np.sin(2 * np.pi * 8.7 * t + 1.3) + lowpass_np(rng.normal(0, 0.03, n), 6, fs)
+    # Rung tay sinh lý ~9 Hz + rung ngẫu nhiên (rad/s)
+    trem = 0.012 * np.sin(2 * np.pi * 9.2 * t + rng.uniform(0, 6)) + _smooth_noise(rng, n, 6, fs, 0.03)
+    trem2 = 0.010 * np.sin(2 * np.pi * 8.7 * t + 1.3) + _smooth_noise(rng, n, 6, fs, 0.03)
     yaw, pit = yaw + trem, pit + trem2
-    rollrate = np.gradient(roll, t)
-
     c, s = np.cos(roll), np.sin(roll)
-    gx = rollrate
-    gy = c * pit + s * yaw
-    gz = -s * pit + c * yaw
-    bias = np.array([0.012, -0.018, 0.015])                       # bias gyro (rad/s)
-    g = np.stack([gx, gy, gz], 1) + bias + rng.normal(0, 0.006, (n, 3))
+    g = np.stack([c * pit + s * yaw,            # gx: pitch
+                  np.gradient(roll, t),         # gy: roll
+                  -s * pit + c * yaw], 1)       # gz: yaw
+    g = g + rng.normal(0, 0.006, (n, 3))        # chip đã bù zero drift: không có bias, chỉ còn nhiễu
+    g = g / (2.0 * np.pi)                       # rad/s -> vòng/giây (chuẩn đầu vào)
 
-    theta = np.cumsum(pit / fs)                                   # góc chúc mũi
-    lin = np.abs(np.gradient(yaw, t))[:, None] * rng.normal(0, 0.05, (n, 3))  # gia tốc tịnh tiến khi vẩy
-    a = np.stack([-G * np.sin(theta), G * np.cos(theta) * s, G * np.cos(theta) * c], 1)
-    a = a + lin + rng.normal(0, 0.04, (n, 3))
+    theta = np.cumsum(pit / fs)                 # góc ngẩng mũi remote
+    a = np.stack([G * np.cos(theta) * s, -G * np.sin(theta), G * np.cos(theta) * c], 1)
+    a = a + rng.normal(0, 0.04, (n, 3))
 
-    g = g / (2.0 * np.pi)                                         # rad/s -> rev/s (chuẩn đầu vào)
     df = pd.DataFrame(dict(t=np.round(t, 5), gx=g[:, 0], gy=g[:, 1], gz=g[:, 2],
                            ax=a[:, 0], ay=a[:, 1], az=a[:, 2], phase=phase))
     df.to_csv(path, index=False, float_format="%.6f")
     print(f"Đã tạo dữ liệu mẫu: {path} ({n} sample, {T:.1f} s)")
 
 
-def lowpass_np(x, fc, fs):
-    y = np.empty_like(x)
-    a = _alpha(1 / fs, fc)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = y[i - 1] + a * (x[i] - y[i - 1])
-    return y
-
-
 # ----------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="So sánh thuật toán air-mouse offline")
-    ap.add_argument("csv", nargs="?", help="file CSV dữ liệu IMU")
-    ap.add_argument("--make-demo", metavar="OUT.csv", help="tạo dữ liệu mẫu rồi thoát")
+    ap = argparse.ArgumentParser(description="Xem thuật toán con trỏ air-mouse (C++) chạy trên log sensor")
+    ap.add_argument("csv", nargs="?", help="log sensor (t, gx, gy, gz vòng/giây) hoặc output của gyro_replay")
+    ap.add_argument("--make-demo", metavar="OUT.csv", help="tạo log mẫu (mô phỏng) rồi thoát")
+    ap.add_argument("--replay", metavar="PATH", help="đường dẫn gyro_replay (mặc định: cpp/build/)")
+    ap.add_argument("--sensitivity", type=int, default=5, help="Độ nhạy 1..10, mặc định 5")
+    ap.add_argument("--stability", type=int, default=5, help="Độ ổn định 1..10, mặc định 5")
+    ap.add_argument("--fps", type=float, default=60.0,
+                    help="tốc độ frame của TV, mặc định 60 (0 = xử lý mọi sample)")
     ap.add_argument("--time-unit", choices=["s", "ms"], default="s")
-    ap.add_argument("--gyro-unit", choices=["rev", "rad", "deg"], default="rev",
-                    help="đơn vị gx/gy/gz trong CSV: rev = vòng/giây (mặc định), rad = rad/s, deg = °/s")
-    ap.add_argument("--remap", help='đổi trục cảm biến, ví dụ "x=y,y=-x,z=z"')
+    ap.add_argument("--yaw-axis", default="z", help="cột gyro điều khiển con trỏ ngang, mặc định z (có thể -z)")
+    ap.add_argument("--pitch-axis", default="x", help="cột gyro điều khiển con trỏ dọc, mặc định x (có thể -x)")
     ap.add_argument("--screen", type=lambda s: tuple(int(v) for v in s.lower().split("x")),
                     default=(1920, 1080), help="kích thước màn hình, mặc định 1920x1080")
-    ap.add_argument("--calib", type=float, default=1.0,
-                    help="số giây đầu (remote để yên) dùng để ước lượng bias, mặc định 1.0")
-    ap.add_argument("--K", type=float, default=2700)
-    ap.add_argument("--deadzone", type=float, default=0.02)
-    ap.add_argument("--accel", type=float, default=0.5)
-    ap.add_argument("--fc", type=float, default=8.0)
-    ap.add_argument("--mincut", type=float, default=1.0)
-    ap.add_argument("--beta", type=float, default=0.05)
-    ap.add_argument("--kp", type=float, default=1.0, help="Mahony Kp")
-    ap.add_argument("--ki", type=float, default=0.02, help="Mahony Ki")
     ap.add_argument("--save", metavar="OUT.png", help="xuất ảnh thay vì mở cửa sổ")
     ap.add_argument("--window", type=float, nargs=2, metavar=("T0", "T1"),
                     help="khung thời gian hiển thị khi --save")
@@ -620,8 +466,15 @@ def main():
         return
     if not args.csv:
         ap.error("cần đường dẫn CSV (hoặc --make-demo OUT.csv)")
-    data = load_csv(args.csv, args.time_unit, args.gyro_unit, args.remap)
-    run_ui(data, args)
+
+    header = set(c.strip().lower() for c in pd.read_csv(args.csv, nrows=0).columns)
+    if OUTPUT_COLUMNS <= header:
+        # Đã là output của gyro_replay: chỉ vẽ, không đổi được thiết lập.
+        df = pd.read_csv(args.csv, keep_default_na=False)
+        df.columns = [c.strip().lower() for c in df.columns]
+        run_ui(("output", df, args.csv), args)
+    else:
+        run_ui(("log", args.csv, find_replay(args.replay)), args)
 
 
 if __name__ == "__main__":

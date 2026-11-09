@@ -18,8 +18,15 @@ target_compile_features(gyro_pointer INTERFACE cxx_std_17)
 add_executable(gyro_pointer_example example/main.cpp)
 target_link_libraries(gyro_pointer_example PRIVATE gyro_pointer)
 
-if(MSVC)
-    target_compile_options(gyro_pointer_example PRIVATE /W4)
-else()
-    target_compile_options(gyro_pointer_example PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+# Offline replay: runs a recorded sensor log through the core algorithm
+# and writes the result for the Python visualizer (imu_viz.py).
+add_executable(gyro_replay tools/gyro_replay.cpp)
+target_link_libraries(gyro_replay PRIVATE gyro_pointer)
+
+foreach(target gyro_pointer_example gyro_replay)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()

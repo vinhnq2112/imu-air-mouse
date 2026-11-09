@@ -27,7 +27,13 @@ Các số đo:
 
 ## Chạy
 
-Cần Python 3.9+, `numpy`, `pandas`, `matplotlib`.
+Cần Python 3.9+. Cài các package (`numpy`, `pandas`, `matplotlib`):
+
+```bash
+python -m venv .venv                 # tuỳ chọn: tạo môi trường riêng
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
 ```bash
 python imu_viz.py demo.csv                       # cửa sổ tương tác

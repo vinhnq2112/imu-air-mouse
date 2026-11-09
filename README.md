@@ -31,17 +31,20 @@ Cần Python 3.9+, `numpy`, `pandas`, `matplotlib`.
 
 ```bash
 python imu_viz.py demo.csv                       # cửa sổ tương tác
-python imu_viz.py my_log.csv --gyro-unit deg     # log thật, gyro tính bằng °/s
+python imu_viz.py my_log.csv                     # log thật, gyro tính bằng vòng/giây
+python imu_viz.py old_log.csv --gyro-unit rad    # log cũ theo rad/s (hoặc deg nếu là °/s)
 python imu_viz.py demo.csv --save report.png     # xuất ảnh, không mở cửa sổ
 python imu_viz.py --make-demo demo.csv           # tạo lại dữ liệu mẫu (mô phỏng)
 ```
 
 ## Định dạng CSV
 
+**Chuẩn đơn vị đầu vào của cả repo: vận tốc góc tính bằng vòng/giây (rev/s)**, giống đầu ra của sensor. Tool Python và bản C++ đều nhận đúng đơn vị này, nên một file log dùng được cho cả hai. Bên trong, thuật toán tự đổi sang rad/s.
+
 | Cột | Ý nghĩa |
 |---|---|
 | `t` | thời gian (s; thêm `--time-unit ms` nếu là ms) |
-| `gx, gy, gz` | vận tốc góc (rad/s; thêm `--gyro-unit deg` nếu là °/s) |
+| `gx, gy, gz` | vận tốc góc, **vòng/giây** (1.0 = 360°/s). Log cũ theo rad/s hoặc °/s thì thêm `--gyro-unit rad` / `deg` |
 | `ax, ay, az` | gia tốc (đơn vị bất kỳ) |
 | `qw, qx, qy, qz` | *(tuỳ chọn)* quaternion của chip |
 | `phase` | *(tuỳ chọn)* `still` / `line` / `flick` / `circle` — cần `still` để tính jitter/drift, `line` để tính độ lệch |

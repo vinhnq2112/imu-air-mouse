@@ -9,13 +9,14 @@ cho phép kéo slider chỉnh tham số và tự tính các số đo (jitter, dr
 Cách chạy:
     python imu_viz.py --make-demo demo.csv      # tạo dữ liệu mẫu để thử
     python imu_viz.py demo.csv                  # mở cửa sổ tương tác
-    python imu_viz.py my_log.csv --gyro-unit deg --save report.png   # xuất ảnh
+    python imu_viz.py my_log.csv --save report.png                   # xuất ảnh
 
 Cần: Python 3.9+, numpy, pandas, matplotlib.
 
 Định dạng CSV (dòng đầu là header):
     t               thời gian (giây; thêm --time-unit ms nếu là mili giây)
-    gx, gy, gz      vận tốc góc (rad/s; thêm --gyro-unit deg nếu là °/s)
+    gx, gy, gz      vận tốc góc (vòng/giây, 1.0 = 360°/s; log cũ theo rad/s hoặc °/s
+                    thì thêm --gyro-unit rad / deg). Bên trong tool đổi sang rad/s.
     ax, ay, az      gia tốc (đơn vị nào cũng được, chỉ dùng hướng trọng lực)
     qw, qx, qy, qz  (tuỳ chọn) quaternion do chip fusion xuất ra
     phase           (tuỳ chọn) nhãn đoạn test: still / line / flick / circle / ...
@@ -70,7 +71,7 @@ def apply_remap(v, m):
     return np.stack([m[i][1] * v[:, m[i][0]] for i in range(3)], axis=1)
 
 
-def load_csv(path, time_unit="s", gyro_unit="rad", remap=None):
+def load_csv(path, time_unit="s", gyro_unit="rev", remap=None):
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
     need = ["t", "gx", "gy", "gz", "ax", "ay", "az"]
@@ -86,8 +87,11 @@ def load_csv(path, time_unit="s", gyro_unit="rad", remap=None):
     dt[0] = np.median(dt[1:])
     dt = np.clip(dt, 1e-4, 0.1)  # chặn sample lỗi / mất gói
 
+    # Chuẩn đầu vào: vòng/giây (rev/s). Thuật toán bên trong tính theo rad/s.
     g = df[["gx", "gy", "gz"]].to_numpy(float)
-    if gyro_unit == "deg":
+    if gyro_unit == "rev":
+        g = g * (2.0 * np.pi)
+    elif gyro_unit == "deg":
         g = np.radians(g)
     a = df[["ax", "ay", "az"]].to_numpy(float)
     if remap:
@@ -569,6 +573,7 @@ def make_demo(path, seed=1):
     a = np.stack([-G * np.sin(theta), G * np.cos(theta) * s, G * np.cos(theta) * c], 1)
     a = a + lin + rng.normal(0, 0.04, (n, 3))
 
+    g = g / (2.0 * np.pi)                                         # rad/s -> rev/s (chuẩn đầu vào)
     df = pd.DataFrame(dict(t=np.round(t, 5), gx=g[:, 0], gy=g[:, 1], gz=g[:, 2],
                            ax=a[:, 0], ay=a[:, 1], az=a[:, 2], phase=phase))
     df.to_csv(path, index=False, float_format="%.6f")
@@ -590,7 +595,8 @@ def main():
     ap.add_argument("csv", nargs="?", help="file CSV dữ liệu IMU")
     ap.add_argument("--make-demo", metavar="OUT.csv", help="tạo dữ liệu mẫu rồi thoát")
     ap.add_argument("--time-unit", choices=["s", "ms"], default="s")
-    ap.add_argument("--gyro-unit", choices=["rad", "deg"], default="rad")
+    ap.add_argument("--gyro-unit", choices=["rev", "rad", "deg"], default="rev",
+                    help="đơn vị gx/gy/gz trong CSV: rev = vòng/giây (mặc định), rad = rad/s, deg = °/s")
     ap.add_argument("--remap", help='đổi trục cảm biến, ví dụ "x=y,y=-x,z=z"')
     ap.add_argument("--screen", type=lambda s: tuple(int(v) for v in s.lower().split("x")),
                     default=(1920, 1080), help="kích thước màn hình, mặc định 1920x1080")

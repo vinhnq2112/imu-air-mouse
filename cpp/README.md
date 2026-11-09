@@ -31,7 +31,7 @@ pointer.SetSettings(sensitivity, stability);
 
 - Kiểu `float2` có `x()` / `y()` trả về tham chiếu.
 - Các id input `angularVelocityX`, `angularVelocityZ`.
-- Hàm `getInputstate(id)` trả về vận tốc góc theo **vòng/giây** (1.0 = 360°/s).
+- Hàm `getInputstate(id)` trả về vận tốc góc theo **vòng/giây** (1.0 = 360°/s). Đây cũng là đơn vị chuẩn của cột `gx, gy, gz` trong CSV của tool Python, nên log ghi từ sensor dùng chung được cho cả hai.
 
 ```cpp
 #include "MyEngine.h"      // float2, getInputstate, angularVelocity*

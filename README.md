@@ -49,3 +49,7 @@ python imu_viz.py --make-demo demo.csv           # tạo lại dữ liệu mẫu
 Quy ước trục: **X = mũi remote, Y = trái, Z = lên**. Nếu cảm biến gắn khác, dùng `--remap "x=y,y=-x,z=z"`.
 
 `demo.csv` là dữ liệu **mô phỏng**, chỉ để thử tool.
+
+## Bản C++
+
+Thuật toán đã chốt (stillness lock + precision mode, low-pass filter, gain curve sigmoid, 2 thiết lập Độ nhạy / Độ ổn định) có bản C++ header-only trong [`cpp/`](cpp/), kèm ví dụ và hướng dẫn build.
